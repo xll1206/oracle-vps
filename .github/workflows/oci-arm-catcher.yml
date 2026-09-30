@@ -169,7 +169,7 @@ jobs:
               attempt=$((attempt + 1))
               log "第 $attempt 次尝试 | AD=$ad"
 
-              OUT="$(oci --no-retry compute instance launch \
+              if OUT="$(oci --no-retry compute instance launch \
                 --availability-domain "$ad" \
                 --compartment-id "$OCI_CLI_TENANCY" \
                 --shape VM.Standard.A1.Flex \
@@ -179,12 +179,15 @@ jobs:
                 --assign-public-ip true \
                 --display-name "$DISPLAY_NAME" \
                 "${METADATA_ARG[@]}" \
-                --output json 2>&1)"
-              RC=$?
+                --output json 2>&1)"; then
+                RC=0
+              else
+                RC=$?
+              fi
 
               # -------- 成功：打印 OCID 与公网 IP，然后停止 --------
               if [ "$RC" -eq 0 ]; then
-                INSTANCE_ID="$(printf '%s' "$OUT" | jq -r '.data.id')"
+                INSTANCE_ID="$(printf '%s' "$OUT" | jq -r '.data.id' 2>/dev/null || true)"
                 log "=========================================================="
                 log "抢机成功！实例 OCID: $INSTANCE_ID"
                 log "=========================================================="
