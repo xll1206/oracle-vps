@@ -1,0 +1,240 @@
+name: OCI ARM Catcher
+
+# ============================================================
+# 在 GitHub Actions 上自动抢购 Oracle Cloud Always Free ARM 实例
+# 目标规格: VM.Standard.A1.Flex
+#
+# 触发方式:
+#   1) schedule        —— 每 6 小时自动跑一次
+#   2) workflow_dispatch —— 手动点按钮触发（用于测试/临时加抢）
+#
+# 设计要点:
+#   * 单个 job 内自行控时，循环约 5.5 小时后优雅退出
+#     （GitHub 单 job 硬上限 6 小时，超时会被强制杀死）
+#   * 所有凭据与参数一律从 GitHub Secrets 读取，仓库里不留任何明文
+#   * launch 一律加全局 --no-retry：OCI CLI 默认会对 5xx 内部重试，
+#     单次调用会卡约 110 秒，必须让脚本自己控节奏
+#   * 错误按「消息文本」分类，而不是状态码
+#     （"没容量" 是 HTTP 500 InternalError，只看状态码会误判）
+# ============================================================
+
+on:
+  schedule:
+    # 每 6 小时触发一次（cron 使用 UTC 时区）
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# 防止两次调度重叠（上一轮还在跑时，新的一轮排队等待）
+concurrency:
+  group: oci-arm-catcher
+  cancel-in-progress: false
+
+jobs:
+  catch-arm:
+    runs-on: ubuntu-latest
+    # 355 分钟 = 5 小时 55 分。脚本自身会在 5.5 小时处退出，
+    # 这里留出余量给环境准备与收尾，避免被 GitHub 强杀。
+    timeout-minutes: 355
+
+    env:
+      OCI_CLI_USER: ${{ secrets.OCI_CLI_USER }}
+      OCI_CLI_FINGERPRINT: ${{ secrets.OCI_CLI_FINGERPRINT }}
+      OCI_CLI_TENANCY: ${{ secrets.OCI_CLI_TENANCY }}
+      OCI_CLI_REGION: ${{ secrets.OCI_CLI_REGION }}
+      OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_CLI_KEY_CONTENT }}
+      SUBNET_ID: ${{ secrets.SUBNET_ID }}
+      IMAGE_ID: ${{ secrets.IMAGE_ID }}
+      AD_LIST: ${{ secrets.AD_LIST }}
+      OCPUS: ${{ secrets.OCPUS }}
+      MEMORY_GB: ${{ secrets.MEMORY_GB }}
+      DISPLAY_NAME: ${{ secrets.DISPLAY_NAME }}
+      # 可选的登录公钥（强烈建议配置，否则抢到后无法 SSH 登录）
+      SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+      # 关掉公私钥文件权限告警，保持日志干净
+      OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
+      OCI_CLI_AUTH: api_key
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------------------
+      # 安装 OCI CLI（pip 方式），并用缓存加速后续运行
+      # ------------------------------------------------------------
+      - name: 缓存 OCI CLI 虚拟环境
+        uses: actions/cache@v4
+        with:
+          path: ~/oci-cli-venv
+          key: oci-cli-venv-${{ runner.os }}-v1
+
+      - name: 安装 OCI CLI
+        run: |
+          set -euo pipefail
+          # 缓存命中且可用 → 直接复用；否则重建
+          if ! "$HOME/oci-cli-venv/bin/oci" --version >/dev/null 2>&1; then
+            rm -rf "$HOME/oci-cli-venv"
+            python3 -m venv "$HOME/oci-cli-venv"
+            "$HOME/oci-cli-venv/bin/pip" install --upgrade pip
+            "$HOME/oci-cli-venv/bin/pip" install oci-cli
+          fi
+          echo "$HOME/oci-cli-venv/bin" >> "$GITHUB_PATH"
+          "$HOME/oci-cli-venv/bin/oci" --version
+
+      # ------------------------------------------------------------
+      # 还原 ~/.oci/config 与 API 私钥（权限 600）
+      # ------------------------------------------------------------
+      - name: 还原 OCI 配置与私钥
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.oci"
+
+          printf '%s\n' "$OCI_CLI_KEY_CONTENT" > "$HOME/.oci/oci_api_key.pem"
+          chmod 600 "$HOME/.oci/oci_api_key.pem"
+
+          cat > "$HOME/.oci/config" <<EOF
+          [DEFAULT]
+          user=$OCI_CLI_USER
+          fingerprint=$OCI_CLI_FINGERPRINT
+          tenancy=$OCI_CLI_TENANCY
+          region=$OCI_CLI_REGION
+          key_file=$HOME/.oci/oci_api_key.pem
+          EOF
+          chmod 600 "$HOME/.oci/config"
+
+          echo "OCI 凭据文件已就绪（内容不会打印到日志）。"
+
+      # ------------------------------------------------------------
+      # 主循环：查存量 → 按可用域轮询 launch → 抢到即停
+      # ------------------------------------------------------------
+      - name: 抢机循环（约 5.5 小时，抢到即停）
+        run: |
+          set -uo pipefail
+
+          ROUND_INTERVAL=60        # 每个可用域之间的基础间隔（秒）
+          MAX_BACKOFF=900          # 限流指数退避上限（秒）
+          RUN_SECONDS=19800        # 5.5 小时，自设退出时限
+          DEADLINE=$(( $(date +%s) + RUN_SECONDS ))
+
+          log() { echo "[$(date -u '+%Y-%m-%d %H:%M:%S')Z] $*"; }
+
+          # ---------- 步骤 1：先查存量实例，避免抢出第二台 ----------
+          log "检查账号中是否已存在 A1 实例..."
+          EXISTING="$(oci compute instance list \
+                --compartment-id "$OCI_CLI_TENANCY" \
+                --all \
+                --output json 2>/dev/null \
+              | jq -r '[.data[]
+                         | select(.shape == "VM.Standard.A1.Flex")
+                         | select(."lifecycle-state" != "TERMINATED")
+                         | select(."lifecycle-state" != "TERMINATING")
+                         | .id] | .[]' 2>/dev/null || true)"
+
+          if [ -n "${EXISTING}" ]; then
+            log "已存在 A1 实例，无需抢机，直接结束："
+            echo "$EXISTING"
+            exit 0
+          fi
+          log "未发现存量 A1 实例，开始抢机。"
+
+          # ---------- 步骤 2：解析可用域列表 ----------
+          IFS=',' read -ra ADS <<< "${AD_LIST}"
+          if [ "${#ADS[@]}" -eq 0 ] || [ -z "${ADS[0]}" ]; then
+            log "AD_LIST 为空，无法继续，请检查 Secret 配置。"
+            exit 1
+          fi
+          log "可用域列表: ${ADS[*]}"
+          log "目标规格: ${OCPUS} OCPU / ${MEMORY_GB} GB，可用域数 ${#ADS[@]}"
+
+          # ---------- 步骤 3：轮询抢机 ----------
+          attempt=0
+          backoff=0
+          METADATA_ARG=()
+          if [ -n "${SSH_PUBLIC_KEY:-}" ]; then
+            METADATA_ARG=(--metadata "{\"ssh_authorized_keys\": \"${SSH_PUBLIC_KEY}\"}")
+            log "已注入 SSH 登录公钥。"
+          else
+            log "警告: 未配置 SSH_PUBLIC_KEY，抢到的实例将无法直接 SSH 登录。"
+          fi
+
+          while :; do
+            for ad in "${ADS[@]}"; do
+              if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+                log "已到自设时限（5.5 小时），本轮运行结束，等待下次调度。"
+                exit 0
+              fi
+
+              attempt=$((attempt + 1))
+              log "第 $attempt 次尝试 | AD=$ad"
+
+              OUT="$(oci --no-retry compute instance launch \
+                --availability-domain "$ad" \
+                --compartment-id "$OCI_CLI_TENANCY" \
+                --shape VM.Standard.A1.Flex \
+                --shape-config "{\"ocpus\": ${OCPUS}, \"memoryInGBs\": ${MEMORY_GB}}" \
+                --image-id "$IMAGE_ID" \
+                --subnet-id "$SUBNET_ID" \
+                --assign-public-ip true \
+                --display-name "$DISPLAY_NAME" \
+                "${METADATA_ARG[@]}" \
+                --output json 2>&1)"
+              RC=$?
+
+              # -------- 成功：打印 OCID 与公网 IP，然后停止 --------
+              if [ "$RC" -eq 0 ]; then
+                INSTANCE_ID="$(printf '%s' "$OUT" | jq -r '.data.id')"
+                log "=========================================================="
+                log "抢机成功！实例 OCID: $INSTANCE_ID"
+                log "=========================================================="
+
+                PUBIP=""
+                for _ in $(seq 1 30); do
+                  PUBIP="$(oci compute instance list-vnics \
+                      --instance-id "$INSTANCE_ID" \
+                      --query 'data[0]."public-ip"' \
+                      --raw-output 2>/dev/null || true)"
+                  if [ -n "$PUBIP" ] && [ "$PUBIP" != "null" ]; then
+                    break
+                  fi
+                  sleep 10
+                done
+
+                log "公网 IP: ${PUBIP:-（尚未分配，请稍后在 OCI 控制台查看）}"
+                log "抢到即停，本次运行结束。"
+                exit 0
+              fi
+
+              # -------- 失败：按消息文本分类 --------
+              MSG="$(printf '%s' "$OUT" | tr -d '\r')"
+
+              if printf '%s' "$MSG" | grep -qiE 'Out of host capacity|Out of capacity for shape'; then
+                backoff=0
+                log "容量不足（$ad），换下一个可用域继续。"
+                sleep $(( ROUND_INTERVAL + RANDOM % 30 ))
+
+              elif printf '%s' "$MSG" | grep -qiE 'TooManyRequests|User-rate limit exceeded'; then
+                if [ "$backoff" -eq 0 ]; then
+                  backoff=$ROUND_INTERVAL
+                else
+                  backoff=$(( backoff * 2 ))
+                fi
+                if [ "$backoff" -gt "$MAX_BACKOFF" ]; then
+                  backoff=$MAX_BACKOFF
+                fi
+                log "触发限流（429），指数退避 ${backoff}s 后继续。"
+                sleep "$backoff"
+
+              elif printf '%s' "$MSG" | grep -qiE 'NotAuthenticated|NotAuthorized|LimitExceeded'; then
+                log "致命错误（认证 / 权限 / 配额），立即退出，不做无脑循环："
+                printf '%s\n' "$MSG" | head -n 30
+                exit 1
+
+              else
+                log "未识别错误，按瞬时错误处理，换下一个可用域："
+                printf '%s\n' "$MSG" | head -n 30
+                sleep $(( ROUND_INTERVAL + RANDOM % 30 ))
+              fi
+            done
+          done
